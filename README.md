@@ -50,11 +50,6 @@ The easiest way to use the Journal Entry ID Creator is through the graphical use
 python3 journal_entry_gui.py
 ```
 
-Or use the launcher scripts:
-- **macOS/Linux**: Double-click `launch_gui.sh` or run `./launch_gui.sh`
-- **Windows**: Double-click `launch_gui.bat`
-- **Cross-platform**: Double-click `launch_gui.py`
-
 **GUI Features:**
 - 📁 Browse and select input Excel file
 - 📂 Choose output file location (auto-suggested)
