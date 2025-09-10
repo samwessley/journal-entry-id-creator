@@ -30,6 +30,23 @@ class JournalEntryCreator:
         self.journal_lines = None
         self.grouped_entries = {}
         self.unassigned_lines = []
+    
+    def _normalize_and_deduplicate_columns(self, columns):
+        """Return stripped, non-empty, unique column names by suffixing duplicates."""
+        normalized = []
+        for col in columns:
+            name = '' if pd.isna(col) else str(col).strip()
+            if name.lower() in ('', 'nan', 'none'):
+                name = 'Unnamed'
+            normalized.append(name)
+        seen = {}
+        unique_cols = []
+        for name in normalized:
+            count = seen.get(name, 0)
+            unique_name = f"{name}_{count}" if count > 0 else name
+            seen[name] = count + 1
+            unique_cols.append(unique_name)
+        return unique_cols
         
     def load_data(self, file_path):
         """Load journal lines from Excel file"""
@@ -65,8 +82,9 @@ class JournalEntryCreator:
                 print("No data found in Excel file. Please add journal line data.")
                 return False
             
-            # Set column names from template
+            # Set column names from template and ensure uniqueness/cleanliness
             df.columns = template_row[:len(df.columns)]  # Handle case where data has fewer columns
+            df.columns = self._normalize_and_deduplicate_columns(df.columns)
             
             # Remove completely empty rows
             df = df.dropna(how='all')
@@ -126,7 +144,11 @@ class JournalEntryCreator:
         return optional_cols
     
     def check_balance(self, group_df):
-        """Check if a group of journal lines is balanced (debits = credits)"""
+        """Check if a group of journal lines is balanced and has minimum 2 lines"""
+        # Must have at least 2 lines for a valid journal entry
+        if len(group_df) < 2:
+            return False
+            
         total_debits = group_df['Debit Amount'].sum()
         total_credits = group_df['Credit Amount'].sum()
         
@@ -172,37 +194,60 @@ class JournalEntryCreator:
         for fields in field_combinations:
             print(f"\nTrying grouping by: {fields}")
             
-            # Get unassigned lines
-            unassigned_df = self.journal_lines[~self.journal_lines['_row_index'].isin(assigned_lines)].copy()
+            # Get unassigned lines using a safer approach
+            unassigned_mask = ~self.journal_lines['_row_index'].isin(assigned_lines)
+            unassigned_df = self.journal_lines[unassigned_mask].copy()
             
             if len(unassigned_df) == 0:
                 print("All lines have been assigned to journal entries.")
                 break
             
+            # Reset index to avoid any potential conflicts
+            unassigned_df = unassigned_df.reset_index(drop=True)
+            
             # Group by the current field combination
             valid_fields = [col for col in fields if col in unassigned_df.columns]
-            grouped = unassigned_df.groupby(valid_fields)
+            # Dedupe fields and guard against empty grouping list
+            valid_fields = list(dict.fromkeys(valid_fields))
+            if not valid_fields:
+                continue
+            
+            # Use a more robust grouping approach
+            try:
+                # Create a safe copy for grouping
+                grouping_df = unassigned_df[valid_fields + ['Debit Amount', 'Credit Amount', '_row_index']].copy()
+                grouped = grouping_df.groupby(valid_fields, dropna=False, sort=False)
+            except Exception as e:
+                print(f"   Error grouping by {valid_fields}: {e}")
+                continue
             
             balanced_groups = 0
             groups_processed = 0
             
-            for group_key, group_df in grouped:
+            for group_key, group_indices in grouped.groups.items():
                 groups_processed += 1
+                # Get the actual group data using safe indexing
+                group_df = unassigned_df.iloc[group_indices].copy()
+                
                 if self.check_balance(group_df):
                     # Create journal entry ID
                     je_id = f"JE{journal_entry_id:04d}"
                     
-                    # Store the journal entry
+                    # Store the journal entry with completely fresh index
+                    group_df_clean = group_df.copy()
+                    group_df_clean = group_df_clean.reset_index(drop=True)
+                    
                     self.grouped_entries[je_id] = {
-                        'lines': group_df.copy(),
+                        'lines': group_df_clean,
                         'grouping_fields': fields,
                         'group_key': group_key,
-                        'total_debits': group_df['Debit Amount'].sum(),
-                        'total_credits': group_df['Credit Amount'].sum()
+                        'total_debits': group_df_clean['Debit Amount'].sum(),
+                        'total_credits': group_df_clean['Credit Amount'].sum()
                     }
                     
-                    # Mark these lines as assigned
-                    assigned_lines.update(group_df['_row_index'].tolist())
+                    # Mark these lines as assigned using original row indices
+                    original_indices = group_df['_row_index'].tolist()
+                    assigned_lines.update(original_indices)
                     
                     journal_entry_id += 1
                     balanced_groups += 1
@@ -214,13 +259,90 @@ class JournalEntryCreator:
             if balanced_groups > 0:
                 print(f"  -> Successfully created {balanced_groups} specific journal entries")
         
-        # Track unassigned lines
+        # Handle remaining unassigned lines using safer approach
+        remaining_mask = ~self.journal_lines['_row_index'].isin(assigned_lines)
+        remaining_lines = self.journal_lines[remaining_mask].copy().reset_index(drop=True)
+        
+        if len(remaining_lines) > 0:
+            print(f"\nProcessing {len(remaining_lines)} remaining lines...")
+            
+            for idx, line in remaining_lines.iterrows():
+                debit = line['Debit Amount']
+                credit = line['Credit Amount']
+                line_date = line['Posted Date']
+                original_row_idx = line['_row_index']
+                
+                # Handle zero-amount lines by assigning to existing journal entry on same date
+                if debit == 0 and credit == 0:
+                    print(f"   Zero-amount line found, assigning to existing entry on {line_date.strftime('%Y-%m-%d')}")
+                    
+                    # Find existing journal entry on the same date
+                    assigned_to_existing = False
+                    for je_id, entry_data in self.grouped_entries.items():
+                        if len(entry_data['lines']) > 0:
+                            entry_date = entry_data['lines']['Posted Date'].iloc[0]
+                            if entry_date.date() == line_date.date():
+                                # Create a new dataframe for the line with clean index
+                                line_dict = line.to_dict()
+                                line_df = pd.DataFrame([line_dict])
+                                line_df = line_df.reset_index(drop=True)
+                                
+                                # Safely append to existing entry
+                                existing_lines = entry_data['lines'].copy().reset_index(drop=True)
+                                combined_lines = pd.concat([existing_lines, line_df], ignore_index=True)
+                                
+                                # Update the entry
+                                entry_data['lines'] = combined_lines
+                                entry_data['total_debits'] += line['Debit Amount']
+                                entry_data['total_credits'] += line['Credit Amount']
+                                assigned_lines.add(original_row_idx)
+                                assigned_to_existing = True
+                                print(f"   → Assigned to {je_id}")
+                                break
+                    
+                    # If no existing entry found, create new one
+                    if not assigned_to_existing:
+                        je_id = f"JE{journal_entry_id:04d}"
+                        line_dict = line.to_dict()
+                        line_df = pd.DataFrame([line_dict]).reset_index(drop=True)
+                        self.grouped_entries[je_id] = {
+                            'lines': line_df,
+                            'grouping_fields': ['Zero Amount Entry'],
+                            'group_key': f"Zero amount: {line['Account ID']}",
+                            'total_debits': debit,
+                            'total_credits': credit
+                        }
+                        assigned_lines.add(original_row_idx)
+                        journal_entry_id += 1
+                        print(f"   → Created new entry {je_id}")
+                
+                # Skip invalid lines (both debit and credit non-zero)
+                elif debit != 0 and credit != 0:
+                    print(f"   Invalid line (both debit and credit): Account {line['Account ID']}")
+                    continue
+                
+                # Create individual journal entry for valid single lines
+                else:
+                    je_id = f"JE{journal_entry_id:04d}"
+                    line_dict = line.to_dict()
+                    line_df = pd.DataFrame([line_dict]).reset_index(drop=True)
+                    self.grouped_entries[je_id] = {
+                        'lines': line_df,
+                        'grouping_fields': ['Individual Entry'],
+                        'group_key': f"Single line: {line['Account ID']}",
+                        'total_debits': debit,
+                        'total_credits': credit
+                    }
+                    assigned_lines.add(original_row_idx)
+                    journal_entry_id += 1
+        
+        # Track any truly unassigned lines (invalid entries)
         self.unassigned_lines = self.journal_lines[~self.journal_lines['_row_index'].isin(assigned_lines)].copy()
         
         print(f"\nSummary:")
         print(f"Total journal entries created: {len(self.grouped_entries)}")
         print(f"Total lines assigned: {len(assigned_lines)}")
-        print(f"Total lines unassigned: {len(self.unassigned_lines)}")
+        print(f"Total lines unassigned (invalid): {len(self.unassigned_lines)}")
         
         return True
     
@@ -276,19 +398,48 @@ class JournalEntryCreator:
         print("JOURNAL ENTRY SUMMARY REPORT")
         print("="*60)
         
+        # Separate multi-line and single-line entries for better reporting
+        multi_line_entries = []
+        single_line_entries = []
+        
         for je_id, entry_data in sorted(self.grouped_entries.items()):
-            lines = entry_data['lines']
-            print(f"\n{je_id}:")
-            print(f"  Date: {lines['Posted Date'].iloc[0].strftime('%Y-%m-%d')}")
-            print(f"  Lines: {len(lines)}")
-            print(f"  Total Debits: ${entry_data['total_debits']:,.2f}")
-            print(f"  Total Credits: ${entry_data['total_credits']:,.2f}")
-            print(f"  Grouped by: {entry_data['grouping_fields']}")
-            if len(entry_data['grouping_fields']) > 1:
-                print(f"  Group values: {entry_data['group_key']}")
+            if len(entry_data['lines']) > 1:
+                multi_line_entries.append((je_id, entry_data))
+            else:
+                single_line_entries.append((je_id, entry_data))
+        
+        # Report multi-line entries
+        if multi_line_entries:
+            print(f"\nMULTI-LINE JOURNAL ENTRIES ({len(multi_line_entries)}):")
+            for je_id, entry_data in multi_line_entries:
+                lines = entry_data['lines']
+                print(f"\n{je_id}:")
+                print(f"  Date: {lines['Posted Date'].iloc[0].strftime('%Y-%m-%d')}")
+                print(f"  Lines: {len(lines)}")
+                print(f"  Total Debits: ${entry_data['total_debits']:,.2f}")
+                print(f"  Total Credits: ${entry_data['total_credits']:,.2f}")
+                print(f"  Grouped by: {entry_data['grouping_fields']}")
+                if len(entry_data['grouping_fields']) > 1 and entry_data['grouping_fields'][0] != 'Individual Entry':
+                    print(f"  Group values: {entry_data['group_key']}")
+        
+        # Report single-line entries (summary only)
+        if single_line_entries:
+            print(f"\nSINGLE-LINE JOURNAL ENTRIES ({len(single_line_entries)}):")
+            print("  (Each line created as individual journal entry)")
+            for je_id, entry_data in single_line_entries[:5]:  # Show first 5 examples
+                lines = entry_data['lines']
+                line = lines.iloc[0]
+                print(f"  {je_id}: {line['Posted Date'].strftime('%Y-%m-%d')}, "
+                      f"Account: {line['Account ID']}, "
+                      f"Debit: ${line['Debit Amount']:.2f}, "
+                      f"Credit: ${line['Credit Amount']:.2f}")
+            
+            if len(single_line_entries) > 5:
+                print(f"  ... and {len(single_line_entries) - 5} more single-line entries")
         
         if len(self.unassigned_lines) > 0:
-            print(f"\nUNASSIGNED LINES ({len(self.unassigned_lines)}):")
+            print(f"\nINVALID LINES ({len(self.unassigned_lines)}):")
+            print("  (Lines with both debit and credit, or both zero)")
             for _, line in self.unassigned_lines.iterrows():
                 print(f"  Date: {line['Posted Date'].strftime('%Y-%m-%d')}, "
                       f"Account: {line['Account ID']}, "

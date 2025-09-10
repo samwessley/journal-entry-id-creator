@@ -86,9 +86,12 @@ The script uses a sophisticated algorithm to create journal entries:
    - Posted Date + 1 optional field
    - Posted Date + 2 optional fields  
    - Posted Date + 3 optional fields (default max)
-4. **Balance Checking**: For each grouping, verifies that total debits = total credits
-5. **ID Assignment**: Assigns unique Journal Entry IDs (JE0001, JE0002, etc.)
-6. **Output Generation**: Creates new Excel file with Journal ID column added
+4. **Balance Checking**: For each grouping, verifies that:
+   - Total debits = total credits
+   - Group has at least 2 lines (minimum for valid journal entry)
+5. **Individual Entry Assignment**: Remaining unmatched lines are assigned individual journal IDs
+6. **ID Assignment**: Assigns unique Journal Entry IDs (JE0001, JE0002, etc.) to ALL lines
+7. **Output Generation**: Creates new Excel file with Journal ID column added
 
 ## Output
 
@@ -148,5 +151,6 @@ The GUI provides an intuitive interface with the following features:
 
 - Maximum 5 optional fields used for grouping by default (configurable up to 8)
 - Requires exact balance (debits = credits within 0.01 tolerance)
+- Requires minimum 2 lines per journal entry (accounting standard)
 - All lines in a journal entry must have identical posted dates
 - Does not handle multi-currency transactions
