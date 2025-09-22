@@ -254,10 +254,40 @@ class JournalEntryGUI:
                 if not creator.load_data(input_file):
                     raise Exception("Failed to load data from input file")
                 
+                # Validate balances before attempting to create entries
+                self.root.after(0, lambda: self.append_results("Validating balances (overall, by date, by month if needed)..."))
+                creator.validate_balances()
+                
                 # Create journal entries
                 self.root.after(0, lambda: self.append_results("Creating journal entries..."))
                 if not creator.create_journal_entries(max_fields):
                     raise Exception("Failed to create journal entries")
+                
+                # If there are unassigned lines, prompt to auto-balance with plug
+                if len(creator.unassigned_lines) > 0:
+                    self.root.after(0, lambda: self.append_results(
+                        f"Found {len(creator.unassigned_lines)} unassigned lines after grouping."))
+                    def ask_balance():
+                        return messagebox.askyesno(
+                            "Unbalanced Entries Detected",
+                            "There are unassigned/unbalanced journal lines by date.\n\n"
+                            "Would you like to automatically add plug lines using account 'Audit Sight Clearing' "
+                            "to balance each affected date?"
+                        )
+                    user_choice = self.root.after(0, ask_balance)
+                    # Run synchronously to capture user choice
+                    choice = messagebox.askyesno(
+                        "Unbalanced Entries Detected",
+                        "There are unassigned/unbalanced journal lines by date.\n\n"
+                        "Would you like to automatically add plug lines using account 'Audit Sight Clearing' "
+                        "to balance each affected date?"
+                    )
+                    if choice:
+                        balanced_dates = creator.balance_unassigned_with_plug()
+                        self.root.after(0, lambda: self.append_results(
+                            f"Added plug lines for {balanced_dates} posted date(s)."))
+                    else:
+                        raise Exception("User declined to auto-balance unassigned lines.")
                 
                 # Generate output
                 self.root.after(0, lambda: self.append_results("Generating output file..."))

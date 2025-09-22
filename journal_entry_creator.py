@@ -30,6 +30,8 @@ class JournalEntryCreator:
         self.journal_lines = None
         self.grouped_entries = {}
         self.unassigned_lines = []
+        self.additional_output_lines = []  # rows to append to output (e.g., plug lines)
+        self.additional_output_lines = []  # rows to append to output (e.g., plug lines)
     
     def _normalize_and_deduplicate_columns(self, columns):
         """Return stripped, non-empty, unique column names by suffixing duplicates."""
@@ -143,6 +145,164 @@ class JournalEntryCreator:
         
         return optional_cols
     
+    def validate_balances(self, epsilon=0.01, return_details=False):
+        """Validate balances overall, by posted date, and by month.
+
+        If return_details is True, returns a dict with diagnostics:
+            {
+              'ok': bool,
+              'overall': {'debits': float, 'credits': float, 'net': float},
+              'by_date': DataFrame with debits, credits, net, diff,
+              'unbalanced_dates': DataFrame subset,
+              'by_month': DataFrame with debits, credits, net, diff,
+              'unbalanced_months': DataFrame subset,
+              'messages': [str, ...]
+            }
+        Otherwise, raises ValueError on failure, returns True on success.
+        """
+        if self.journal_lines is None or len(self.journal_lines) == 0:
+            if return_details:
+                return {'ok': False, 'messages': ["No journal lines loaded to validate."]}
+            raise ValueError("No journal lines loaded to validate.")
+
+        if 'Posted Date' not in self.journal_lines.columns:
+            if return_details:
+                return {'ok': False, 'messages': ["Required column 'Posted Date' is missing."]}
+            raise ValueError("Required column 'Posted Date' is missing.")
+
+        df = self.journal_lines.copy()
+        details = {'messages': []}
+
+        # Overall
+        total_debits = float(df['Debit Amount'].sum())
+        total_credits = float(df['Credit Amount'].sum())
+        overall_net = total_debits - total_credits
+        details['overall'] = {
+            'debits': total_debits,
+            'credits': total_credits,
+            'net': overall_net,
+        }
+        if abs(overall_net) >= epsilon:
+            details['messages'].append(
+                f"Overall debits and credits do not balance. Total Debits: ${total_debits:,.2f}, Total Credits: ${total_credits:,.2f}, Difference: ${overall_net:,.2f}."
+            )
+
+        # Per date
+        df['__date__'] = df['Posted Date'].dt.date
+        by_date = df.groupby('__date__', dropna=False)[['Debit Amount', 'Credit Amount']].sum()
+        by_date = by_date.rename(columns={'Debit Amount': 'debits', 'Credit Amount': 'credits'})
+        by_date['net'] = by_date['debits'] - by_date['credits']
+        by_date['diff'] = by_date['net'].abs()
+        unbalanced_dates = by_date[by_date['diff'] >= epsilon]
+        details['by_date'] = by_date
+        details['unbalanced_dates'] = unbalanced_dates
+        if len(unbalanced_dates) > 0:
+            msg_lines = ["Unbalanced posted dates detected (debits != credits):"]
+            for d, row in unbalanced_dates.iterrows():
+                msg_lines.append(
+                    f"  - {d}: Debits=${row['debits']:,.2f}, Credits=${row['credits']:,.2f}, Difference=${row['net']:,.2f}"
+                )
+            details['messages'].append("\n".join(msg_lines))
+
+        # Per month (only meaningful to report if any date unbalanced or overall unbalanced)
+        df['__month__'] = df['Posted Date'].dt.to_period('M')
+        by_month = df.groupby('__month__', dropna=False)[['Debit Amount', 'Credit Amount']].sum()
+        by_month = by_month.rename(columns={'Debit Amount': 'debits', 'Credit Amount': 'credits'})
+        by_month['net'] = by_month['debits'] - by_month['credits']
+        by_month['diff'] = by_month['net'].abs()
+        unbalanced_months = by_month[by_month['diff'] >= epsilon]
+        details['by_month'] = by_month
+        details['unbalanced_months'] = unbalanced_months
+        if len(unbalanced_months) > 0:
+            msg_lines = ["Unbalanced posted months detected (debits != credits):"]
+            for m, row in unbalanced_months.iterrows():
+                msg_lines.append(
+                    f"  - {m}: Debits=${row['debits']:,.2f}, Credits=${row['credits']:,.2f}, Difference=${row['net']:,.2f}"
+                )
+            details['messages'].append("\n".join(msg_lines))
+
+        # Cleanup
+        df.drop(columns=['__date__', '__month__'], inplace=True)
+
+        ok = len(details['messages']) == 0
+        details['ok'] = ok
+        if return_details:
+            return details
+        if not ok:
+            raise ValueError("\n\n".join(details['messages']))
+        return True
+
+    def add_plug_lines_for_imbalances(self, details, plug_account_id="Audit Sight Clearing", epsilon=0.01):
+        """Append plug lines to self.journal_lines to fix overall/date/month imbalances.
+
+        Strategy:
+        - If per-date imbalances exist: add one plug per unbalanced date on that date
+        - Else if per-month imbalances exist: add one plug per unbalanced month on the last date present in that month
+        - Else if only overall imbalance exists: add one plug dated on the latest Posted Date in data
+        """
+        if self.journal_lines is None or len(self.journal_lines) == 0:
+            return 0
+
+        df = self.journal_lines
+        next_row_index = int(df['_row_index'].max()) + 1 if '_row_index' in df.columns and len(df) > 0 else 0
+        plugs_added = 0
+
+        def append_plug_row(date_value, net):
+            nonlocal next_row_index, plugs_added
+            if abs(net) < epsilon:
+                return
+            plug_debit = 0.0
+            plug_credit = 0.0
+            if net > 0:
+                # More debits → add credit
+                plug_credit = abs(net)
+            else:
+                plug_debit = abs(net)
+            plug = {
+                'Posted Date': pd.to_datetime(date_value),
+                'Account ID': plug_account_id,
+                'Debit Amount': plug_debit,
+                'Credit Amount': plug_credit,
+                '_row_index': next_row_index,
+            }
+            # Fill any other optional columns with None
+            for col in df.columns:
+                if col not in plug:
+                    plug[col] = None
+            self.journal_lines = pd.concat([self.journal_lines, pd.DataFrame([plug])], ignore_index=True)
+            next_row_index += 1
+            plugs_added += 1
+
+        # Prefer date-level fix when present
+        if details.get('unbalanced_dates') is not None and len(details['unbalanced_dates']) > 0:
+            for date_value, row in details['unbalanced_dates'].iterrows():
+                append_plug_row(date_value, float(row['net']))
+            return plugs_added
+
+        # Otherwise fix at month level
+        if details.get('unbalanced_months') is not None and len(details['unbalanced_months']) > 0:
+            # pick the last date present in each month
+            df_tmp = self.journal_lines.copy()
+            df_tmp['__month__'] = df_tmp['Posted Date'].dt.to_period('M')
+            for month_period, row in details['unbalanced_months'].iterrows():
+                # latest date in that month
+                candidates = df_tmp[df_tmp['__month__'] == month_period]['Posted Date']
+                if len(candidates) > 0:
+                    date_value = pd.to_datetime(candidates.max())
+                else:
+                    # fallback: first day of month
+                    date_value = pd.Period(month_period, freq='M').to_timestamp(how='end')
+                append_plug_row(date_value, float(row['net']))
+            return plugs_added
+
+        # Otherwise only overall imbalance
+        net = details.get('overall', {}).get('net', 0.0)
+        if abs(net) >= epsilon:
+            # use latest date in data
+            last_date = pd.to_datetime(self.journal_lines['Posted Date'].max())
+            append_plug_row(last_date, float(net))
+        return plugs_added
+
     def check_balance(self, group_df):
         """Check if a group of journal lines is balanced and has minimum 2 lines"""
         # Must have at least 2 lines for a valid journal entry
@@ -346,6 +506,99 @@ class JournalEntryCreator:
         
         return True
     
+    def balance_unassigned_with_plug(self, plug_account_id="Audit Sight Clearing", epsilon=0.01):
+        """Create balancing journal entries per posted date for unassigned lines by adding a plug line.
+
+        - Groups unassigned lines by Posted Date (date-only)
+        - For each date group, creates a new JE containing those lines
+        - Adds one plug line with Account ID = plug_account_id for the offset amount
+        - Records the plug line to be appended to output
+        Returns number of dates balanced (int).
+        """
+        if self.journal_lines is None:
+            print("No data loaded. Cannot balance.")
+            return 0
+        if len(self.unassigned_lines) == 0:
+            print("No unassigned lines to balance.")
+            return 0
+
+        dates_balanced = 0
+        # Determine next journal entry id number
+        next_id_num = 1
+        if len(self.grouped_entries) > 0:
+            # existing IDs like JE0001
+            try:
+                nums = [int(k[2:]) for k in self.grouped_entries.keys() if str(k).startswith("JE")]
+                if nums:
+                    next_id_num = max(nums) + 1
+            except Exception:
+                pass
+
+        # Group unassigned by date
+        df_un = self.unassigned_lines.copy()
+        df_un['__date__'] = df_un['Posted Date'].dt.date
+        for date_value, group in df_un.groupby('__date__'):
+            # Build new JE lines from original unassigned lines
+            group_clean = group.copy().reset_index(drop=True)
+            total_debits = float(group_clean['Debit Amount'].sum())
+            total_credits = float(group_clean['Credit Amount'].sum())
+            net = total_debits - total_credits
+
+            je_id = f"JE{next_id_num:04d}"
+            next_id_num += 1
+
+            # Create plug line if needed
+            plug_debit = 0.0
+            plug_credit = 0.0
+            if abs(net) >= epsilon:
+                if net > 0:
+                    # More debits than credits → add credit
+                    plug_credit = abs(net)
+                else:
+                    # More credits than debits → add debit
+                    plug_debit = abs(net)
+
+                # Build plug line with same schema as journal_lines
+                plug_row = {col: None for col in self.journal_lines.columns}
+                plug_row['Posted Date'] = pd.to_datetime(date_value)
+                plug_row['Account ID'] = plug_account_id
+                plug_row['Debit Amount'] = plug_debit
+                plug_row['Credit Amount'] = plug_credit
+                plug_row['_row_index'] = -1  # not in original data
+
+                # Append plug row into the JE lines for internal reporting
+                group_with_plug = pd.concat([group_clean, pd.DataFrame([plug_row])], ignore_index=True)
+            else:
+                group_with_plug = group_clean
+
+            # Store as a new JE
+            self.grouped_entries[je_id] = {
+                'lines': group_with_plug.reset_index(drop=True),
+                'grouping_fields': ['Posted Date'],
+                'group_key': str(date_value),
+                'total_debits': float(group_with_plug['Debit Amount'].sum()),
+                'total_credits': float(group_with_plug['Credit Amount'].sum())
+            }
+
+            # Mark original unassigned as now assigned for output mapping
+            # (we'll assign Journal IDs via _row_index mapping; plug line handled separately)
+
+            # Record additional output line for plug (without _row_index)
+            if abs(net) >= epsilon:
+                add_line = {col: None for col in self.journal_lines.columns if col != '_row_index'}
+                add_line['Posted Date'] = pd.to_datetime(date_value)
+                add_line['Account ID'] = plug_account_id
+                add_line['Debit Amount'] = plug_debit
+                add_line['Credit Amount'] = plug_credit
+                # Keep for output append with Journal ID later
+                self.additional_output_lines.append({'Journal ID': je_id, **add_line})
+
+            dates_balanced += 1
+
+        # After creating new JEs, clear unassigned_lines so reporting reflects resolution
+        self.unassigned_lines = self.journal_lines.iloc[0:0].copy()
+        return dates_balanced
+    
     def generate_output(self, input_file_path, output_file_path=None):
         """Generate output Excel file with Journal ID column"""
         if self.journal_lines is None:
@@ -365,6 +618,19 @@ class JournalEntryCreator:
         
         # Remove the temporary row index column
         output_df = output_df.drop('_row_index', axis=1)
+
+        # Append any additional output lines (e.g., plug lines)
+        if self.additional_output_lines:
+            # Ensure all expected columns exist
+            cols_set = set(output_df.columns)
+            add_rows = []
+            for row in self.additional_output_lines:
+                # row already includes 'Journal ID' and base columns
+                # Fill any missing columns
+                completed = {col: row.get(col, None) for col in output_df.columns}
+                add_rows.append(completed)
+            if add_rows:
+                output_df = pd.concat([output_df, pd.DataFrame(add_rows)], ignore_index=True)
         
         # Reorder columns to put Journal ID before Posted Date
         cols = list(output_df.columns)
@@ -452,25 +718,69 @@ def main():
     parser.add_argument('-o', '--output', help='Path to output Excel file (optional)')
     parser.add_argument('--max-fields', type=int, default=5, 
                        help='Maximum number of optional fields to use for grouping (default: 5)')
+    parser.add_argument('--auto-balance', action='store_true',
+                       help="If set, automatically add plug lines using 'Audit Sight Clearing' to balance unassigned dates")
     
     args = parser.parse_args()
     
     # Create journal entry creator
     creator = JournalEntryCreator()
     
-    # Load data
-    if not creator.load_data(args.input_file):
+    try:
+        # Load data
+        if not creator.load_data(args.input_file):
+            return 1
+        
+        # Validate balances (overall, per-date, and per-month when needed)
+        details = creator.validate_balances(return_details=True)
+        if not details['ok']:
+            print("Imbalances detected:\n" + "\n\n".join(details['messages']))
+            if args.auto_balance:
+                added = creator.add_plug_lines_for_imbalances(details)
+                print(f"Auto-added {added} plug line(s) to balance.")
+            else:
+                try:
+                    resp = input("Add plug lines using 'Audit Sight Clearing' to fix these imbalances? [y/N]: ").strip().lower()
+                except EOFError:
+                    resp = 'n'
+                if resp == 'y':
+                    added = creator.add_plug_lines_for_imbalances(details)
+                    print(f"Added {added} plug line(s) to balance.")
+                else:
+                    print("User declined to auto-balance imbalances. Aborting.")
+                    return 1
+        
+        # Create journal entries
+        if not creator.create_journal_entries(args.max_fields):
+            return 1
+        
+        # If unassigned lines remain, optionally prompt in CLI or auto-balance via flag
+        if len(creator.unassigned_lines) > 0:
+            print(f"Unassigned lines remain: {len(creator.unassigned_lines)}")
+            if args.auto_balance:
+                balanced_dates = creator.balance_unassigned_with_plug()
+                print(f"Auto-balanced by adding plug lines for {balanced_dates} posted date(s).")
+            else:
+                # Interactive prompt
+                try:
+                    resp = input("Add plug lines using 'Audit Sight Clearing' to balance unassigned dates? [y/N]: ").strip().lower()
+                except EOFError:
+                    resp = 'n'
+                if resp == 'y':
+                    balanced_dates = creator.balance_unassigned_with_plug()
+                    print(f"Added plug lines for {balanced_dates} posted date(s).")
+                else:
+                    print("User declined to auto-balance unassigned lines. Exiting.")
+                    return 1
+        
+        # Generate output
+        if not creator.generate_output(args.input_file, args.output):
+            return 1
+        
+        return 0
+    except Exception as e:
+        print(f"Error: {e}")
         return 1
-    
-    # Create journal entries
-    if not creator.create_journal_entries(args.max_fields):
-        return 1
-    
-    # Generate output
-    if not creator.generate_output(args.input_file, args.output):
-        return 1
-    
-    return 0
 
 if __name__ == "__main__":
     exit(main())
