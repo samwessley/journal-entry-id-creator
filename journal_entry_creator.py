@@ -31,7 +31,52 @@ class JournalEntryCreator:
         self.grouped_entries = {}
         self.unassigned_lines = []
         self.additional_output_lines = []  # rows to append to output (e.g., plug lines)
-        self.additional_output_lines = []  # rows to append to output (e.g., plug lines)
+        self._id_counts = {}
+
+    def _sanitize_field_name(self, name):
+        s = str(name).strip()
+        return ''.join(ch if ch.isalnum() or ch in (' ', '_', '-') else '_' for ch in s).replace(' ', '_')
+
+    def _format_value_token(self, value):
+        if pd.isna(value):
+            return 'NA'
+        if isinstance(value, (pd.Timestamp, np.datetime64)):
+            try:
+                dt = pd.to_datetime(value)
+                return dt.strftime('%Y%m%d')
+            except Exception:
+                return self._sanitize_field_name(str(value))
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            return str(value).replace('.', '_')
+        # strings / others
+        return self._sanitize_field_name(str(value))
+
+    def generate_journal_id(self, grouping_fields, group_key, max_len=100):
+        # Normalize grouping_fields and group_key to aligned values
+        fields = list(grouping_fields) if isinstance(grouping_fields, (list, tuple)) else [grouping_fields]
+        if isinstance(group_key, tuple):
+            values = list(group_key)
+        else:
+            values = [group_key]
+        min_len = min(len(fields), len(values))
+        tokens = [self._format_value_token(values[i]) for i in range(min_len)]
+        if not tokens:
+            base = 'ID'
+        else:
+            base = '-'.join(tokens)
+        # Truncate to max_len
+        if len(base) > max_len:
+            base = base[:max_len]
+        # Ensure uniqueness across entire run while respecting max_len
+        count = self._id_counts.get(base, 0)
+        self._id_counts[base] = count + 1
+        if count == 0:
+            return base
+        suffix = f"__{count+1}"
+        # If appending suffix exceeds max_len, trim base accordingly
+        if len(base) + len(suffix) > max_len:
+            base = base[: max_len - len(suffix)]
+        return f"{base}{suffix}"
     
     def _normalize_and_deduplicate_columns(self, columns):
         """Return stripped, non-empty, unique column names by suffixing duplicates."""
@@ -390,8 +435,8 @@ class JournalEntryCreator:
                 group_df = unassigned_df.iloc[group_indices].copy()
                 
                 if self.check_balance(group_df):
-                    # Create journal entry ID
-                    je_id = f"JE{journal_entry_id:04d}"
+                    # Create field-based journal entry ID
+                    je_id = self.generate_journal_id(valid_fields, group_key)
                     
                     # Store the journal entry with completely fresh index
                     group_df_clean = group_df.copy()
@@ -409,7 +454,6 @@ class JournalEntryCreator:
                     original_indices = group_df['_row_index'].tolist()
                     assigned_lines.update(original_indices)
                     
-                    journal_entry_id += 1
                     balanced_groups += 1
             
             print(f"Found {balanced_groups} balanced journal entries from {groups_processed} groups with this grouping")
@@ -462,18 +506,17 @@ class JournalEntryCreator:
                     
                     # If no existing entry found, create new one
                     if not assigned_to_existing:
-                        je_id = f"JE{journal_entry_id:04d}"
+                        je_id = self.generate_journal_id(['Posted Date'], (line_date,))
                         line_dict = line.to_dict()
                         line_df = pd.DataFrame([line_dict]).reset_index(drop=True)
                         self.grouped_entries[je_id] = {
                             'lines': line_df,
-                            'grouping_fields': ['Zero Amount Entry'],
-                            'group_key': f"Zero amount: {line['Account ID']}",
+                            'grouping_fields': ['Posted Date'],
+                            'group_key': line_date,
                             'total_debits': debit,
                             'total_credits': credit
                         }
                         assigned_lines.add(original_row_idx)
-                        journal_entry_id += 1
                         print(f"   → Created new entry {je_id}")
                 
                 # Skip invalid lines (both debit and credit non-zero)
@@ -483,18 +526,17 @@ class JournalEntryCreator:
                 
                 # Create individual journal entry for valid single lines
                 else:
-                    je_id = f"JE{journal_entry_id:04d}"
+                    je_id = self.generate_journal_id(['Posted Date', 'Account ID'], (line_date, line['Account ID']))
                     line_dict = line.to_dict()
                     line_df = pd.DataFrame([line_dict]).reset_index(drop=True)
                     self.grouped_entries[je_id] = {
                         'lines': line_df,
-                        'grouping_fields': ['Individual Entry'],
-                        'group_key': f"Single line: {line['Account ID']}",
+                        'grouping_fields': ['Posted Date', 'Account ID'],
+                        'group_key': (line_date, line['Account ID']),
                         'total_debits': debit,
                         'total_credits': credit
                     }
                     assigned_lines.add(original_row_idx)
-                    journal_entry_id += 1
         
         # Track any truly unassigned lines (invalid entries)
         self.unassigned_lines = self.journal_lines[~self.journal_lines['_row_index'].isin(assigned_lines)].copy()
@@ -544,8 +586,7 @@ class JournalEntryCreator:
             total_credits = float(group_clean['Credit Amount'].sum())
             net = total_debits - total_credits
 
-            je_id = f"JE{next_id_num:04d}"
-            next_id_num += 1
+            je_id = self.generate_journal_id(['Posted Date'], (date_value,))
 
             # Create plug line if needed
             plug_debit = 0.0

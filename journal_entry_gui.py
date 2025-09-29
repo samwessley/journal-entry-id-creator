@@ -256,7 +256,26 @@ class JournalEntryGUI:
                 
                 # Validate balances before attempting to create entries
                 self.root.after(0, lambda: self.append_results("Validating balances (overall, by date, by month if needed)..."))
-                creator.validate_balances()
+                details = creator.validate_balances(return_details=True)
+                if not details.get('ok', True):
+                    # Show messages in the results pane
+                    imbalance_text = "\n\n".join(details.get('messages', []))
+                    self.root.after(0, lambda: self.append_results("Imbalances detected:"))
+                    for line in imbalance_text.split("\n"):
+                        self.root.after(0, lambda l=line: self.append_results(l))
+                    # Ask user to add plug lines now to fix imbalances
+                    choice_fix = messagebox.askyesno(
+                        "Imbalances Detected",
+                        "Overall and/or per-date/month imbalances were detected.\n\n"
+                        "Would you like to automatically add plug lines using account 'Audit Sight Clearing' "
+                        "to fix these imbalances and continue?"
+                    )
+                    if choice_fix:
+                        added = creator.add_plug_lines_for_imbalances(details)
+                        self.root.after(0, lambda: self.append_results(
+                            f"Added {added} plug line(s) to fix imbalances."))
+                    else:
+                        raise Exception("User declined to auto-balance detected imbalances.")
                 
                 # Create journal entries
                 self.root.after(0, lambda: self.append_results("Creating journal entries..."))
@@ -267,15 +286,6 @@ class JournalEntryGUI:
                 if len(creator.unassigned_lines) > 0:
                     self.root.after(0, lambda: self.append_results(
                         f"Found {len(creator.unassigned_lines)} unassigned lines after grouping."))
-                    def ask_balance():
-                        return messagebox.askyesno(
-                            "Unbalanced Entries Detected",
-                            "There are unassigned/unbalanced journal lines by date.\n\n"
-                            "Would you like to automatically add plug lines using account 'Audit Sight Clearing' "
-                            "to balance each affected date?"
-                        )
-                    user_choice = self.root.after(0, ask_balance)
-                    # Run synchronously to capture user choice
                     choice = messagebox.askyesno(
                         "Unbalanced Entries Detected",
                         "There are unassigned/unbalanced journal lines by date.\n\n"
