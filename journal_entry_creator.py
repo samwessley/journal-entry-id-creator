@@ -19,6 +19,7 @@ Algorithm:
 
 import pandas as pd
 import numpy as np
+from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations, product
 from collections import defaultdict
 import uuid
@@ -32,6 +33,18 @@ class JournalEntryCreator:
         self.unassigned_lines = []
         self.additional_output_lines = []  # rows to append to output (e.g., plug lines)
         self._id_counts = {}
+
+    def _to_decimal(self, value):
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal('0')
+
+    def _sum_decimal(self, series):
+        total = Decimal('0')
+        for v in series.fillna(0).tolist():
+            total += self._to_decimal(v)
+        return total.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     def _sanitize_field_name(self, name):
         s = str(name).strip()
@@ -220,9 +233,9 @@ class JournalEntryCreator:
         details = {'messages': []}
 
         # Overall
-        total_debits = float(df['Debit Amount'].sum())
-        total_credits = float(df['Credit Amount'].sum())
-        overall_net = total_debits - total_credits
+        total_debits = self._sum_decimal(df['Debit Amount'])
+        total_credits = self._sum_decimal(df['Credit Amount'])
+        overall_net = (total_debits - total_credits)
         details['overall'] = {
             'debits': total_debits,
             'credits': total_credits,
@@ -237,6 +250,8 @@ class JournalEntryCreator:
         df['__date__'] = df['Posted Date'].dt.date
         by_date = df.groupby('__date__', dropna=False)[['Debit Amount', 'Credit Amount']].sum()
         by_date = by_date.rename(columns={'Debit Amount': 'debits', 'Credit Amount': 'credits'})
+        by_date['debits'] = by_date['debits'].apply(lambda x: Decimal(str(x))).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        by_date['credits'] = by_date['credits'].apply(lambda x: Decimal(str(x))).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         by_date['net'] = by_date['debits'] - by_date['credits']
         by_date['diff'] = by_date['net'].abs()
         unbalanced_dates = by_date[by_date['diff'] >= epsilon]
@@ -254,6 +269,8 @@ class JournalEntryCreator:
         df['__month__'] = df['Posted Date'].dt.to_period('M')
         by_month = df.groupby('__month__', dropna=False)[['Debit Amount', 'Credit Amount']].sum()
         by_month = by_month.rename(columns={'Debit Amount': 'debits', 'Credit Amount': 'credits'})
+        by_month['debits'] = by_month['debits'].apply(lambda x: Decimal(str(x))).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        by_month['credits'] = by_month['credits'].apply(lambda x: Decimal(str(x))).apply(lambda x: x.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
         by_month['net'] = by_month['debits'] - by_month['credits']
         by_month['diff'] = by_month['net'].abs()
         unbalanced_months = by_month[by_month['diff'] >= epsilon]
@@ -479,46 +496,24 @@ class JournalEntryCreator:
                 
                 # Handle zero-amount lines by assigning to existing journal entry on same date
                 if debit == 0 and credit == 0:
-                    print(f"   Zero-amount line found, assigning to existing entry on {line_date.strftime('%Y-%m-%d')}")
-                    
-                    # Find existing journal entry on the same date
+                    # Try to attach zero-amount line to an existing JE on same date; otherwise leave unassigned
                     assigned_to_existing = False
                     for je_id, entry_data in self.grouped_entries.items():
                         if len(entry_data['lines']) > 0:
                             entry_date = entry_data['lines']['Posted Date'].iloc[0]
                             if entry_date.date() == line_date.date():
-                                # Create a new dataframe for the line with clean index
-                                line_dict = line.to_dict()
-                                line_df = pd.DataFrame([line_dict])
-                                line_df = line_df.reset_index(drop=True)
-                                
-                                # Safely append to existing entry
+                                line_df = pd.DataFrame([line.to_dict()]).reset_index(drop=True)
                                 existing_lines = entry_data['lines'].copy().reset_index(drop=True)
-                                combined_lines = pd.concat([existing_lines, line_df], ignore_index=True)
-                                
-                                # Update the entry
-                                entry_data['lines'] = combined_lines
+                                entry_data['lines'] = pd.concat([existing_lines, line_df], ignore_index=True)
                                 entry_data['total_debits'] += line['Debit Amount']
                                 entry_data['total_credits'] += line['Credit Amount']
                                 assigned_lines.add(original_row_idx)
                                 assigned_to_existing = True
-                                print(f"   → Assigned to {je_id}")
+                                print(f"   → Assigned zero-amount line to {je_id}")
                                 break
-                    
-                    # If no existing entry found, create new one
                     if not assigned_to_existing:
-                        je_id = self.generate_journal_id(['Posted Date'], (line_date,))
-                        line_dict = line.to_dict()
-                        line_df = pd.DataFrame([line_dict]).reset_index(drop=True)
-                        self.grouped_entries[je_id] = {
-                            'lines': line_df,
-                            'grouping_fields': ['Posted Date'],
-                            'group_key': line_date,
-                            'total_debits': debit,
-                            'total_credits': credit
-                        }
-                        assigned_lines.add(original_row_idx)
-                        print(f"   → Created new entry {je_id}")
+                        # Keep unassigned; will be handled by plug balancing step
+                        continue
                 
                 # Skip invalid lines (both debit and credit non-zero)
                 elif debit != 0 and credit != 0:
@@ -527,19 +522,10 @@ class JournalEntryCreator:
                 
                 # Create individual journal entry for valid single lines
                 else:
-                    je_id = self.generate_journal_id(['Posted Date', 'Account ID'], (line_date, line['Account ID']))
-                    line_dict = line.to_dict()
-                    line_df = pd.DataFrame([line_dict]).reset_index(drop=True)
-                    self.grouped_entries[je_id] = {
-                        'lines': line_df,
-                        'grouping_fields': ['Posted Date', 'Account ID'],
-                        'group_key': (line_date, line['Account ID']),
-                        'total_debits': debit,
-                        'total_credits': credit
-                    }
-                    assigned_lines.add(original_row_idx)
+                    # Do not create single-line entries; leave for plug balancing
+                    continue
         
-        # Track any truly unassigned lines (invalid entries)
+        # Track any remaining lines as unassigned (to be balanced or reported)
         self.unassigned_lines = self.journal_lines[~self.journal_lines['_row_index'].isin(assigned_lines)].copy()
         
         print(f"\nSummary:")
@@ -583,29 +569,27 @@ class JournalEntryCreator:
         for date_value, group in df_un.groupby('__date__'):
             # Build new JE lines from original unassigned lines
             group_clean = group.copy().reset_index(drop=True)
-            total_debits = float(group_clean['Debit Amount'].sum())
-            total_credits = float(group_clean['Credit Amount'].sum())
+            total_debits = self._sum_decimal(group_clean['Debit Amount'])
+            total_credits = self._sum_decimal(group_clean['Credit Amount'])
             net = total_debits - total_credits
 
             je_id = self.generate_journal_id(['Posted Date'], (date_value,))
 
             # Create plug line if needed
-            plug_debit = 0.0
-            plug_credit = 0.0
-            if abs(net) >= epsilon:
+            plug_debit = Decimal('0.00')
+            plug_credit = Decimal('0.00')
+            if net != Decimal('0.00'):
                 if net > 0:
-                    # More debits than credits → add credit
-                    plug_credit = abs(net)
+                    plug_credit = net.copy_abs().quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                 else:
-                    # More credits than debits → add debit
-                    plug_debit = abs(net)
+                    plug_debit = net.copy_abs().quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
                 # Build plug line with same schema as journal_lines
                 plug_row = {col: None for col in self.journal_lines.columns}
                 plug_row['Posted Date'] = pd.to_datetime(date_value)
                 plug_row['Account ID'] = plug_account_id
-                plug_row['Debit Amount'] = plug_debit
-                plug_row['Credit Amount'] = plug_credit
+                plug_row['Debit Amount'] = float(plug_debit)
+                plug_row['Credit Amount'] = float(plug_credit)
                 plug_row['_row_index'] = -1  # not in original data
 
                 # Append plug row into the JE lines for internal reporting
@@ -626,12 +610,12 @@ class JournalEntryCreator:
             # (we'll assign Journal IDs via _row_index mapping; plug line handled separately)
 
             # Record additional output line for plug (without _row_index)
-            if abs(net) >= epsilon:
+            if net != Decimal('0.00'):
                 add_line = {col: None for col in self.journal_lines.columns if col != '_row_index'}
                 add_line['Posted Date'] = pd.to_datetime(date_value)
                 add_line['Account ID'] = plug_account_id
-                add_line['Debit Amount'] = plug_debit
-                add_line['Credit Amount'] = plug_credit
+                add_line['Debit Amount'] = float(plug_debit)
+                add_line['Credit Amount'] = float(plug_credit)
                 # Keep for output append with Journal ID later
                 self.additional_output_lines.append({'Journal ID': je_id, **add_line})
 
