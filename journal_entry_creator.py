@@ -143,8 +143,9 @@ class JournalEntryCreator:
                     print(f"Error: Required column '{col}' not found in Excel file")
                     return False
             
-            # Convert date column to datetime
-            df['Posted Date'] = pd.to_datetime(df['Posted Date'])
+            # Convert date column to datetime and normalize to date-only (00:00)
+            df['Posted Date'] = pd.to_datetime(df['Posted Date'], errors='coerce')
+            df['Posted Date'] = df['Posted Date'].dt.normalize()
             
             # Convert amount columns to numeric, filling NaN with 0
             df['Debit Amount'] = pd.to_numeric(df['Debit Amount'], errors='coerce').fillna(0)
