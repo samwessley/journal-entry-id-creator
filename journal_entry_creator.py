@@ -20,6 +20,7 @@ Algorithm:
 import pandas as pd
 import numpy as np
 from decimal import Decimal, ROUND_HALF_UP
+from openpyxl import load_workbook
 from itertools import combinations, product
 from collections import defaultdict
 import uuid
@@ -33,6 +34,23 @@ class JournalEntryCreator:
         self.unassigned_lines = []
         self.additional_output_lines = []  # rows to append to output (e.g., plug lines)
         self._id_counts = {}
+        self.workbook = None
+        self.ws_jel = None
+        self.ws_ctb = None
+        self.ws_type_row = None
+        self.ws_header_row = None
+        self.ws_data_start_row = None
+        self.template_type = 'old'
+        self.skip_id_creation = False
+        self._plug_lines_added = False
+
+        # New template handling
+        self.workbook = None
+        self.ws_jel = None
+        self.ws_ctb = None
+        self.template_type = 'old'
+        self.skip_id_creation = False
+        self._plug_lines_added = False
 
     def _to_decimal(self, value):
         try:
@@ -49,6 +67,37 @@ class JournalEntryCreator:
     def _sanitize_field_name(self, name):
         s = str(name).strip()
         return ''.join(ch if ch.isalnum() or ch in (' ', '_', '-') else '_' for ch in s).replace(' ', '_')
+
+    def _normalize_header_token(self, token):
+        if token is None:
+            return ''
+        text = str(token)
+        text = text.replace('\u00A0', ' ')
+        text = ' '.join(text.strip().split())
+        return text
+
+    def _canonical(self, token):
+        return self._normalize_header_token(token).lower()
+
+    def _find_header_row(self, df_all, required_names, max_scan_rows=10):
+        """Find a row in df_all (header=None) that contains all required column names (case/space-insensitive)."""
+        required = {self._canonical(n) for n in required_names}
+        rows_to_scan = min(max_scan_rows, len(df_all))
+        for r in range(rows_to_scan):
+            row_vals = [self._normalize_header_token(v) for v in df_all.iloc[r].tolist()]
+            canon = {self._canonical(v) for v in row_vals}
+            if required.issubset(canon):
+                # Build unique headers preserving original tokens (normalized for cleanliness)
+                seen = {}
+                headers = []
+                for v in row_vals:
+                    name = v if v != '' else 'Unnamed'
+                    count = seen.get(name, 0)
+                    unique = f"{name}_{count}" if count > 0 else name
+                    seen[name] = count + 1
+                    headers.append(unique)
+                return r, headers
+        return None, None
 
     def _format_value_token(self, value):
         if pd.isna(value):
@@ -111,7 +160,59 @@ class JournalEntryCreator:
     def load_data(self, file_path):
         """Load journal lines from Excel file"""
         try:
-            # Read the entire file to analyze structure
+            # Try to load as new template first (Journal Entries & Lines sheet)
+            try:
+                wb = load_workbook(file_path)
+                if 'Journal Entries & Lines' in wb.sheetnames:
+                    self.workbook = wb
+                    self.ws_jel = wb['Journal Entries & Lines']
+                    self.ws_ctb = wb['Comparative Trial Balances'] if 'Comparative Trial Balances' in wb.sheetnames else None
+                    self.template_type = 'new'
+                    # Read raw sheet to detect header row robustly
+                    df_all = pd.read_excel(file_path, sheet_name='Journal Entries & Lines', header=None)
+                    if len(df_all) == 0:
+                        print("No data found in Journal Entries & Lines sheet.")
+                        return False
+                    req = ['Posted Date', 'Account ID', 'Debit Amount', 'Credit Amount']
+                    header_row, headers = self._find_header_row(df_all, req, max_scan_rows=10)
+                    if header_row is None:
+                        print("Error: Required columns not found in Journal Entries & Lines sheet")
+                        return False
+                    # header_row is 0-based index where actual field names are found
+                    # In new template: row 0 = Required/Optional, row 1 = field names, row 2+ = data
+                    # But _find_header_row returns the row with field names (row 1, zero-indexed)
+                    self.ws_type_row = header_row  # 0-based row with Required/Optional (row 1 in Excel)
+                    self.ws_header_row = header_row + 1  # Field names row in Excel (1-based)
+                    self.ws_data_start_row = header_row + 2  # Data starts here in Excel (1-based)
+                    df = df_all.iloc[header_row+1:].copy()
+                    df.columns = headers[:len(df.columns)]
+                    # Normalize critical columns by canonical name lookup
+                    # Build mapping from canonical -> actual name
+                    canon_map = {self._canonical(col): col for col in df.columns}
+                    try:
+                        posted_col = canon_map[self._canonical('Posted Date')]
+                        acct_col = canon_map[self._canonical('Account ID')]
+                        debit_col = canon_map[self._canonical('Debit Amount')]
+                        credit_col = canon_map[self._canonical('Credit Amount')]
+                    except KeyError:
+                        print("Error: Required columns not found after header normalization")
+                        return False
+                    # Rename to standard names for internal processing
+                    df = df.rename(columns={posted_col: 'Posted Date', acct_col: 'Account ID', debit_col: 'Debit Amount', credit_col: 'Credit Amount'})
+                    df = df.dropna(how='all')
+                    df['Posted Date'] = pd.to_datetime(df['Posted Date'], errors='coerce').dt.normalize()
+                    df['Debit Amount'] = pd.to_numeric(df['Debit Amount'], errors='coerce').fillna(0)
+                    df['Credit Amount'] = pd.to_numeric(df['Credit Amount'], errors='coerce').fillna(0)
+                    df = df.reset_index(drop=True)
+                    df['_row_index'] = range(len(df))
+                    self.journal_lines = df
+                    print(f"Loaded {len(df)} journal lines from 'Journal Entries & Lines' in {file_path}")
+                    return True
+            except Exception:
+                # Fall back to old template if anything fails
+                pass
+
+            # Read the entire file to analyze structure (old template)
             df_all = pd.read_excel(file_path, header=None)
             
             if len(df_all) == 0:
@@ -335,6 +436,14 @@ class JournalEntryCreator:
             self.journal_lines = pd.concat([self.journal_lines, pd.DataFrame([plug])], ignore_index=True)
             next_row_index += 1
             plugs_added += 1
+            self._plug_lines_added = True
+            # Also track for output appending
+            add_line = {col: None for col in self.journal_lines.columns if col != '_row_index'}
+            add_line['Posted Date'] = pd.to_datetime(date_value)
+            add_line['Account ID'] = plug_account_id
+            add_line['Debit Amount'] = plug_debit
+            add_line['Credit Amount'] = plug_credit
+            self.additional_output_lines.append(add_line)
 
         # Prefer date-level fix when present
         if details.get('unbalanced_dates') is not None and len(details['unbalanced_dates']) > 0:
@@ -618,6 +727,7 @@ class JournalEntryCreator:
                 add_line['Credit Amount'] = float(plug_credit)
                 # Keep for output append with Journal ID later
                 self.additional_output_lines.append({'Journal ID': je_id, **add_line})
+                self._plug_lines_added = True
 
             dates_balanced += 1
 
@@ -631,55 +741,130 @@ class JournalEntryCreator:
             print("No data to output")
             return False
         
-        # Create output dataframe
+        # If using new template workbook, preserve sheets and write IDs/plug lines there
+        if self.template_type == 'new' and self.workbook is not None and self.ws_jel is not None:
+            # Determine output path
+            if output_file_path is None:
+                input_path = Path(input_file_path)
+                output_file_path = input_path.parent / f"{input_path.stem}_with_journal_ids{input_path.suffix}"
+
+            # If skip flag set, just save
+            if self.skip_id_creation:
+                try:
+                    self.workbook.save(output_file_path)
+                    print(f"Output written to: {output_file_path}")
+                    self.print_summary_report()
+                    return True
+                except Exception as e:
+                    print(f"Error writing output file: {e}")
+                    return False
+
+            # Otherwise assign Journal IDs - ALWAYS write to column A (column 1)
+            jid_col_idx = 1
+            # Set header in column A
+            self.ws_jel.cell(row=self.ws_header_row, column=jid_col_idx, value='Journal ID')
+            # Build complete header list for plug line mapping
+            header_cells = self.ws_jel[self.ws_header_row]
+            headers = [cell.value for cell in header_cells]
+            
+            # Find the last row with actual data (not just Journal IDs we might write)
+            last_data_row = self.ws_data_start_row - 1
+            for row in self.ws_jel.iter_rows(min_row=self.ws_data_start_row):
+                # Check if any cell in this row (excluding column A) has data
+                has_data = any(cell.value is not None for cell in row[1:])  # Skip column A
+                if has_data:
+                    last_data_row = row[0].row
+                else:
+                    break
+            
+            # Write Journal IDs to column A for all assigned lines (skip plug lines with _row_index < 0)
+            for je_id, entry_data in self.grouped_entries.items():
+                row_indices = entry_data['lines']['_row_index'].tolist()
+                for idx in row_indices:
+                    # Skip plug lines that were added during balancing (they have negative row index)
+                    if int(idx) < 0:
+                        continue
+                    ws_row = self.ws_data_start_row + int(idx)
+                    self.ws_jel.cell(row=ws_row, column=jid_col_idx, value=je_id)
+            
+            # Append plug lines to the bottom of the sheet - start right after last data row
+            if self.additional_output_lines:
+                # Map column names to indices
+                col_to_idx = {}
+                for i, h in enumerate(headers):
+                    if h:
+                        col_to_idx[h] = i + 1
+                # Also need to map our internal column names to sheet columns
+                # Find Posted Date, Account ID, Debit Amount, Credit Amount columns
+                for i, h in enumerate(headers):
+                    if h and 'posted' in str(h).lower() and 'date' in str(h).lower():
+                        col_to_idx['Posted Date'] = i + 1
+                    elif h and 'account' in str(h).lower() and 'id' in str(h).lower():
+                        col_to_idx['Account ID'] = i + 1
+                    elif h and 'debit' in str(h).lower():
+                        col_to_idx['Debit Amount'] = i + 1
+                    elif h and 'credit' in str(h).lower():
+                        col_to_idx['Credit Amount'] = i + 1
+                
+                # Write each plug line row starting from last_data_row + 1
+                plug_row_start = last_data_row + 1
+                for idx, plug_line in enumerate(self.additional_output_lines):
+                    new_row_idx = plug_row_start + idx
+                    # Write Journal ID if present in plug_line dict
+                    if 'Journal ID' in plug_line:
+                        self.ws_jel.cell(row=new_row_idx, column=jid_col_idx, value=plug_line['Journal ID'])
+                    # Write other fields
+                    for key, val in plug_line.items():
+                        if key == 'Journal ID':
+                            continue
+                        if key in col_to_idx:
+                            self.ws_jel.cell(row=new_row_idx, column=col_to_idx[key], value=val)
+            # Add clearing account to CTB if plug lines were added
+            if self._plug_lines_added and self.ws_ctb is not None:
+                ctbr = self.ws_ctb.max_row + 1
+                self.ws_ctb.cell(row=ctbr, column=1, value='Audit Sight Clearing')
+                self.ws_ctb.cell(row=ctbr, column=2, value='Audit Sight Clearing')
+                self.ws_ctb.cell(row=ctbr, column=3, value=0)
+                self.ws_ctb.cell(row=ctbr, column=4, value=0)
+                self.ws_ctb.cell(row=ctbr, column=5, value='Assets')
+                self.ws_ctb.cell(row=ctbr, column=6, value='asset:current:other')
+                print("Audit Sight Clearing account added to the trial balance in the Comparative Trial Balances tab.")
+            try:
+                self.workbook.save(output_file_path)
+                print(f"Output written to: {output_file_path}")
+                self.print_summary_report()
+                return True
+            except Exception as e:
+                print(f"Error writing output file: {e}")
+                return False
+
+        # Fallback: original single-sheet export
         output_df = self.journal_lines.copy()
-        
-        # Add Journal ID column
         output_df['Journal ID'] = ''
-        
-        # Assign Journal IDs
         for je_id, entry_data in self.grouped_entries.items():
             row_indices = entry_data['lines']['_row_index'].tolist()
             output_df.loc[output_df['_row_index'].isin(row_indices), 'Journal ID'] = je_id
-        
-        # Remove the temporary row index column
         output_df = output_df.drop('_row_index', axis=1)
-
-        # Append any additional output lines (e.g., plug lines)
         if self.additional_output_lines:
-            # Ensure all expected columns exist
-            cols_set = set(output_df.columns)
             add_rows = []
             for row in self.additional_output_lines:
-                # row already includes 'Journal ID' and base columns
-                # Fill any missing columns
                 completed = {col: row.get(col, None) for col in output_df.columns}
                 add_rows.append(completed)
             if add_rows:
                 output_df = pd.concat([output_df, pd.DataFrame(add_rows)], ignore_index=True)
-        
-        # Reorder columns to put Journal ID before Posted Date
         cols = list(output_df.columns)
         cols.remove('Journal ID')
         posted_date_idx = cols.index('Posted Date')
         cols.insert(posted_date_idx, 'Journal ID')
         output_df = output_df[cols]
-        
-        # Generate output file path if not provided
         if output_file_path is None:
             input_path = Path(input_file_path)
             output_file_path = input_path.parent / f"{input_path.stem}_with_journal_ids{input_path.suffix}"
-        
         try:
-            # Write to Excel
             output_df.to_excel(output_file_path, index=False)
             print(f"Output written to: {output_file_path}")
-            
-            # Print summary report
             self.print_summary_report()
-            
             return True
-            
         except Exception as e:
             print(f"Error writing output file: {e}")
             return False
@@ -757,24 +942,32 @@ def main():
         if not creator.load_data(args.input_file):
             return 1
         
-        # Validate balances (overall, per-date, and per-month when needed)
-        details = creator.validate_balances(return_details=True)
-        if not details['ok']:
-            print("Imbalances detected:\n" + "\n\n".join(details['messages']))
-            if args.auto_balance:
-                added = creator.add_plug_lines_for_imbalances(details)
-                print(f"Auto-added {added} plug line(s) to balance.")
-            else:
-                try:
-                    resp = input("Add plug lines using 'Audit Sight Clearing' to fix these imbalances? [y/N]: ").strip().lower()
-                except EOFError:
-                    resp = 'n'
-                if resp == 'y':
+        # If new template with Journal ID column, consider skipping creation
+        if creator.evaluate_provided_journal_ids():
+            # Directly proceed to output with original workbook
+            if not creator.generate_output(args.input_file, args.output):
+                return 1
+            return 0
+        else:
+            # Validate balances (overall, per-date, and per-month when needed)
+            details = creator.validate_balances(return_details=True)
+            if not details['ok']:
+                print("Imbalances detected:\n" + "\n\n".join(details['messages']))
+                print("Unbalanced journal entries or journal entries on multiple dates detected. Running journal entry ID creation logic.")
+                if args.auto_balance:
                     added = creator.add_plug_lines_for_imbalances(details)
-                    print(f"Added {added} plug line(s) to balance.")
+                    print(f"Auto-added {added} plug line(s) to balance.")
                 else:
-                    print("User declined to auto-balance imbalances. Aborting.")
-                    return 1
+                    try:
+                        resp = input("Add plug lines using 'Audit Sight Clearing' to fix these imbalances? [y/N]: ").strip().lower()
+                    except EOFError:
+                        resp = 'n'
+                    if resp == 'y':
+                        added = creator.add_plug_lines_for_imbalances(details)
+                        print(f"Added {added} plug line(s) to balance.")
+                    else:
+                        print("User declined to auto-balance imbalances. Aborting.")
+                        return 1
         
         # Create journal entries
         if not creator.create_journal_entries(args.max_fields):
